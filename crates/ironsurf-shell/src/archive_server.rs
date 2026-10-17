@@ -131,34 +131,50 @@ pub fn address_of(host: &str, port: u16) -> String {
 /// `127.0.0.1` (loopback either way, with no DNS in the picture). A URL, a
 /// path or a `host:port` string is rejected — the bind itself is the final
 /// judge.
+/// The address a form field may ask the archive server to bind: **loopback,
+/// nothing else**. The served folder is unauthenticated — there is no login,
+/// no cookie, no token in front of a plain `GET /…` — so a wildcard or a
+/// routable address would export the user's archive (and after a folder
+/// override, anything on the machine) to whoever can reach the port. The form
+/// still shows the host field, and a rejected one falls back to `127.0.0.1`.
 pub fn normalize_host(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
         return Ok(DEFAULT_HOST.to_string());
     }
-    if trimmed == "localhost" {
+    if trimmed == "localhost" || trimmed == "127.0.0.1" {
         return Ok("127.0.0.1".to_string());
     }
-    if trimmed.contains(['/', '?', '#', ' ', '@', ':']) || trimmed.contains("..") {
-        return Err(format!("not a host: {raw}"));
+    if trimmed == "::1" {
+        return Ok("::1".to_string());
     }
-    let numeric = trimmed.contains('.')
+    // The whole 127/8 is loopback on every platform we ship on.
+    if trimmed.starts_with("127.")
         && trimmed.split('.').all(|label| {
-            !label.is_empty() && label.len() <= 63 && label.bytes().all(|b| b.is_ascii_digit())
-        });
-    if trimmed.contains('.') && !numeric {
-        // Names are fine (they resolve or the bind fails); a string mixing
-        // digits and stray dots is not.
-        let labelish = trimmed.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        });
-        if !labelish {
-            return Err(format!("not a host: {raw}"));
-        }
+            !label.is_empty() && label.len() <= 3 && label.parse::<u8>().is_ok()
+        })
+    {
+        return Ok(trimmed);
     }
-    Ok(trimmed)
+    Err(format!(
+        "only the loopback address may serve the archive (it is unauthenticated): {raw}"
+    ))
+}
+
+/// Folders the archive server will never export, however it is asked: the
+/// system tree and the machine root are not archives, and an unauthenticated
+/// server pointed at them leaks the machine rather than the session. Checked
+/// before anything is created, so a hostile `root` cannot plant directories.
+fn forbidden_root(raw: &str) -> bool {
+    const DENY: [&str; 15] = [
+        "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev", "/proc", "/sys",
+        "/boot", "/run", "/root", "/srv", "/var",
+    ];
+    let trimmed = raw.trim_end_matches('/');
+    let candidate = if trimmed.is_empty() { "/" } else { trimmed };
+    DENY.iter().any(|denied| {
+        candidate == *denied || candidate.starts_with(&format!("{denied}/"))
+    })
 }
 
 /// Parse a port field: empty / `0` / `random` → [`RANDOM_PORT`], else 1–65535.
@@ -191,6 +207,9 @@ pub fn normalize_root(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(&expanded);
     if !path.is_absolute() {
         return Err(format!("folder must be an absolute path: {expanded}"));
+    }
+    if forbidden_root(&expanded) {
+        return Err(format!("{expanded} is a system folder, not an archive folder"));
     }
     std::fs::create_dir_all(&path).map_err(|e| format!("cannot create {expanded}: {e}"))?;
     let canonical = path
@@ -228,10 +247,16 @@ pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
+    // The escape is validated on **bytes**, never by slicing `s` at offsets the
+    // input chose: `%` + two ASCII hex bytes decodes, anything else — including
+    // a `%` in front of a multibyte character, whose bytes are not ASCII hex —
+    // is copied verbatim. `&s[i + 1..i + 3]` used to slice off a char boundary
+    // and panic, and because the request path is decoded here and again per
+    // segment in [`resolve_inside`], one listed file name stopped the server.
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -240,6 +265,16 @@ pub fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A `%XX` digit as 0–15; `None` for anything that is not ASCII hex.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Percent-encode a path for a listing link: `/` survives, everything that is
@@ -766,8 +801,12 @@ pub struct PageState {
     pub spec: Spec,
     /// `http://host:port` while serving (`None` = stopped).
     pub serving: Option<String>,
-    /// The control page's own stable address.
+    /// The control page's own stable address (`None` = render without the
+    /// mutation form, which is how the served origin is answered).
     pub control: Option<String>,
+    /// The session secret the control page's form carries and the control
+    /// socket checks. Empty = this render may not authorize anything.
+    pub token: String,
 }
 
 /// `true` when a note reads as a failure (it gets the red bar).
@@ -832,14 +871,22 @@ pub fn render_control_page(state: &PageState, note: Option<&str>) -> String {
     out.push_str(&note_html);
     out.push_str("  <h2>Status</h2>\n  <table>\n");
     out.push_str(&format!("    <tr><td>Served from</td><td>{serving}</td></tr>\n"));
-    out.push_str(&format!("    <tr><td>This page</td><td>{control}</td></tr>\n"));
+    if let Some(address) = &state.control {
+        out.push_str(&format!("    <tr><td>This page</td><td>{address}</td></tr>\n"));
+    }
     out.push_str(&format!(
         "    <tr><td>Folder in force</td><td><code>{}</code></td></tr>\n  </table>\n\n",
         escape_html(&root)
     ));
+    // The mutation form belongs to the control page alone, and it carries the
+    // session token: without it the control socket refuses the change, so an
+    // `<img>`, a link or a redirect from any other page cannot re-point the
+    // server. On the served origin this whole block is omitted.
+    if !state.token.is_empty() {
     out.push_str(&format!(
         "  <h2>Choose what to serve, and from where</h2>\n  \
-         <form method=\"get\" action=\"{CONTROL_PATH}/apply\">\n    <table>\n      \
+         <form method=\"get\" action=\"{CONTROL_PATH}/apply\">\n    \
+         {token_field}\n    <table>\n      \
          <tr><td style=\"width:8em\">Folder</td><td><input type=\"text\" name=\"root\" \
          value=\"{root}\" placeholder=\"{default_root}\"></td></tr>\n      \
          <tr><td>Host</td><td><input type=\"text\" name=\"host\" value=\"{host}\" \
@@ -852,7 +899,27 @@ pub fn render_control_page(state: &PageState, note: Option<&str>) -> String {
         default_root = escape_html(&default_root),
         host = escape_html(&state.spec.host),
         port = escape_html(&port_text),
+        // AUDIT: the token is the control socket's own credential. A document
+        // loaded from the served folder lives on the served origin, so the
+        // field is emitted only on the control socket's own page — elsewhere
+        // the form is shown but inert (apply/stop answer 403 without it).
+        token_field = match &state.control {
+            Some(_) => format!(
+                "<input type=\"hidden\" name=\"token\" value=\"{}\">",
+                escape_html(&state.token)
+            ),
+            None => String::from(
+                "<!-- the folder, host and port are changed from ironsurf://archive -->"
+            ),
+        },
     ));
+    } else {
+        out.push_str(
+            "  <h2>Choose what to serve, and from where</h2>\n  \
+             <p class=\"sub\">Read-only view: the folder, host and port are set from the \
+             control page, reached by typing <code>ironsurf://archive</code> in the browser.</p>\n",
+        );
+    }
     out.push_str(&format!(
         "  <h2>How it works</h2>\n  <ul>\n    \
          <li>Type <code>ironsurf://archive</code> in the URL bar to reach this page from the \
@@ -893,9 +960,30 @@ pub fn route_request(method: &str, path: &str, query: &str, state: &PageState) -
     if path == CONTROL_PATH {
         let form = parse_form(query);
         let note = form_get(&form, "note");
-        return Response::html(200, render_control_page(state, note), no_body);
+        // AUDIT: a document loaded from the served folder is a document on the
+        // served origin, and one same-origin fetch of this page used to reveal
+        // the "random" control port. The status is fine to show; the control
+        // address and the mutation form are not.
+        let mut view = state.clone();
+        view.control = None;
+        return Response::html(200, render_control_page(&view, note), no_body);
     }
     if path == format!("{CONTROL_PATH}/apply") || path == format!("{CONTROL_PATH}/stop") {
+        // AUDIT: these paths used to defer to the control socket with the whole
+        // query, so a page on the served origin needed neither a token nor even
+        // knowledge of the control port — a top-level navigation follows the
+        // 302 for it. Deferral is now for the control page's own form only,
+        // which carries the session token; anything else is refused here.
+        let form = parse_form(query);
+        if state.token.is_empty()
+            || form_get(&form, "token") != Some(state.token.as_str())
+        {
+            return Response::error(
+                403,
+                "changing the archive server needs the form from the control page \
+                 (type ironsurf://archive in the browser)",
+            );
+        }
         // Changing the server is the control socket's job (its single thread
         // owns the state); point the browser at it.
         // The query rides along: dropping `?root=…&port=…` here would have the
@@ -1073,6 +1161,10 @@ pub fn parse_command(line: &str) -> Option<ServeCmd> {
 #[derive(Default)]
 struct Inner {
     spec: Spec,
+    /// A secret for the life of the process, handed to the control page's form
+    /// and required on every mutation. Nothing else distinguishes the user's
+    /// own form from a request another site arranged.
+    token: String,
     /// `http://host:port` while a serve thread is listening (`None` = stopped).
     address: Option<String>,
     /// Bumped on every re-bind/stop; a serve thread whose generation is older
@@ -1087,6 +1179,8 @@ struct Hub {
     inner: Mutex<Inner>,
     /// The control page's own address (constant for the life of the server).
     control: String,
+    /// The session token (mirrors [`Inner::token`], read without the lock).
+    token: String,
     /// The self-pipe the serve threads `poll()` beside their listener, so a
     /// re-bind/stop wakes a blocked `accept()` immediately: `wake()` opens a
     /// client, writes one byte, and closes it — the read end reports the
@@ -1102,7 +1196,13 @@ impl Hub {
             spec: inner.spec.clone(),
             serving: inner.address.clone(),
             control: Some(self.control.clone()),
+            token: self.token.clone(),
         }
+    }
+
+    /// The token a mutation must present.
+    fn token(&self) -> &str {
+        &self.token
     }
 
     fn generation(&self) -> u64 {
@@ -1174,8 +1274,10 @@ impl ServeHandle {
                 address: address.clone(),
                 generation: 1,
                 shutting_down: false,
+                token: session_token(),
             }),
             control: control_url.clone(),
+            token: session_token(),
             wake: wake_addr,
         });
         drop(wake_tx);
@@ -1406,6 +1508,46 @@ fn handle_connection(mut stream: TcpStream, page: &PageState) {
     let _ = stream.flush();
 }
 
+/// Is this mutation one the user meant? It must carry the session token the
+/// control page embedded — which nothing else can know, and which an `<img>`,
+/// a link or a redirect from another site cannot add — and no browser header
+/// may claim it came from somewhere else (`Origin`/`Referer` are checked when
+/// present, since a cross-site top-level navigation does send them).
+fn mutation_authorized(form: &[(String, String)], hub: &Arc<Hub>, head: &str) -> Result<(), String> {
+    let token = hub.token();
+    if token.is_empty() || form_get(form, "token") != Some(token) {
+        return Err(
+            "changing the archive server needs the form from the control page; a request \
+             without its session token is refused"
+                .to_string(),
+        );
+    }
+    for name in ["origin", "referer"] {
+        if let Some(value) = header_value(head, name) {
+            let authority = hub.control.rsplit_once("://").map(|(_, rest)| rest).unwrap_or("");
+            let sent = value
+                .trim()
+                .rsplit_once("://")
+                .map(|(_, rest)| rest.trim_end_matches('/'))
+                .unwrap_or(value.trim().trim_end_matches('/'));
+            if !sent.is_empty() && sent != authority {
+                return Err(format!(
+                    "a request from {sent} may not change the archive server"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One header value from a request head, case-insensitively.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+    })
+}
+
 /// The form body of a `POST` to the control endpoints: whatever already
 /// arrived after the header block, plus the rest of the declared
 /// `Content-Length` (capped at [`MAX_BODY_BYTES`]; an undeclared length means
@@ -1496,6 +1638,27 @@ fn control_loop(
     send_event(events, ServeEvent::Closed);
 }
 
+/// A per-process secret for the control form: 16 bytes from the OS RNG, or a
+/// mix of clock, pid and a randomly-seeded hasher where no RNG device is open.
+fn session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_ok()
+    {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u64(std::process::id() as u64);
+    format!("{:016x}{:016x}", hasher.finish(), nanos as u64)
+}
+
 /// Has the shell asked for a shutdown (via the control pipe)?
 fn shutdown_requested(hub: &Arc<Hub>) -> bool {
     hub.inner
@@ -1580,6 +1743,12 @@ fn handle_control_connection(
         } else {
             parse_form(&query)
         };
+        if let Err(why) = mutation_authorized(&form, hub, &text) {
+            let response = Response::error(403, &why);
+            let _ = stream.write_all(&response.to_http());
+            let _ = stream.flush();
+            return ControlOutcome::Handled;
+        }
         let note = match apply_form(&form, hub, events) {
             Ok(spec) => format!(
                 "Now serving {} from {}",
@@ -1598,6 +1767,17 @@ fn handle_control_connection(
     }
 
     if path == format!("{CONTROL_PATH}/stop") {
+        let form = if method == "POST" {
+            parse_form(&read_form_body(&mut stream, &text))
+        } else {
+            parse_form(&query)
+        };
+        if let Err(why) = mutation_authorized(&form, hub, &text) {
+            let response = Response::error(403, &why);
+            let _ = stream.write_all(&response.to_http());
+            let _ = stream.flush();
+            return ControlOutcome::Handled;
+        }
         stop_serving(hub, events);
         let response = Response::redirect(&format!(
             "{CONTROL_PATH}?note={}",
@@ -1788,6 +1968,7 @@ mod tests {
             },
             serving: Some("http://127.0.0.1:8123".into()),
             control: Some("http://127.0.0.1:9001".into()),
+            token: "test-token".into(),
         }
     }
 
@@ -1973,20 +2154,41 @@ mod tests {
     #[test]
     fn apply_and_stop_defer_to_the_control_socket_with_their_query() {
         let state = page(sandbox("defer"));
-        let applied = route_request("GET", &format!("{CONTROL_PATH}/apply"), "root=/tmp", &state);
+        let applied = route_request(
+            "GET",
+            &format!("{CONTROL_PATH}/apply"),
+            "root=/tmp&token=test-token",
+            &state,
+        );
         assert_eq!(applied.status, 302);
         assert_eq!(
             applied.location.as_deref(),
-            Some("http://127.0.0.1:9001/ironsurf/serve/apply?root=/tmp"),
+            Some("http://127.0.0.1:9001/ironsurf/serve/apply?root=/tmp&token=test-token"),
             "the form survives the hop"
         );
 
-        let stopped = route_request("GET", &format!("{CONTROL_PATH}/stop"), "", &state);
+        let stopped = route_request(
+            "GET",
+            &format!("{CONTROL_PATH}/stop"),
+            "token=test-token",
+            &state,
+        );
         assert_eq!(stopped.status, 302);
         assert_eq!(
             stopped.location.as_deref(),
-            Some("http://127.0.0.1:9001/ironsurf/serve/stop")
+            Some("http://127.0.0.1:9001/ironsurf/serve/stop?token=test-token")
         );
+
+        // AUDIT: without the form's token the served origin gets no hop to the
+        // control socket at all — a page loaded from the archive cannot even
+        // start a change it has no business making.
+        for path in ["apply", "stop"] {
+            let hostile = route_request("GET", &format!("{CONTROL_PATH}/{path}"), "root=%2F", &state);
+            assert_eq!(
+                hostile.status, 403,
+                "an untokened {path} must be refused on the served origin"
+            );
+        }
 
         // A file request is answered here, never deferred.
         assert_ne!(
@@ -2107,7 +2309,11 @@ mod tests {
         assert_eq!(normalize_host("").unwrap(), "127.0.0.1");
         assert_eq!(normalize_host("localhost").unwrap(), "127.0.0.1");
         assert_eq!(normalize_host(" Localhost ").unwrap(), "127.0.0.1");
-        assert_eq!(normalize_host("0.0.0.0").unwrap(), "0.0.0.0");
+        // AUDIT: the served folder is unauthenticated, so only loopback may bind.
+        assert!(normalize_host("0.0.0.0").is_err());
+        assert!(normalize_host("10.0.0.7").is_err());
+        assert!(normalize_host("corp.example.com").is_err());
+        assert_eq!(normalize_host("127.0.0.53").unwrap(), "127.0.0.53");
         assert!(normalize_host("http://evil.example/").is_err());
         assert!(normalize_host("127.0.0.1:8080").is_err());
         assert!(normalize_host("..").is_err());
@@ -2158,6 +2364,18 @@ mod tests {
     // -- live server ---------------------------------------------------------
 
     /// One request over a fresh connection, returning the whole reply.
+    /// The session token the control page embeds in its form, read the way a
+    /// browser reads it: fetch the control page, take the hidden field.
+    fn control_token(addr: SocketAddr) -> String {
+        let reply = talk(addr, "GET /ironsurf/serve HTTP/1.1\r\n\r\n");
+        reply
+            .split("name=\"token\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     fn talk(addr: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(addr).expect("connect");
         stream
@@ -2320,7 +2538,12 @@ mod tests {
             percent_encode_note(&target.display().to_string()),
             serve_port + 1
         );
-        let reply = talk(control_addr, &format!("GET /ironsurf/serve/apply?{query} HTTP/1.1\r\n\r\n"));
+        let token = control_token(control_addr);
+        assert!(!token.is_empty(), "the control page carries a session token");
+        let reply = talk(
+            control_addr,
+            &format!("GET /ironsurf/serve/apply?{query}&token={token} HTTP/1.1\r\n\r\n"),
+        );
         assert!(reply.starts_with("HTTP/1.1 302"), "REPLY<{reply}>");
         assert!(reply.contains("Now%20serving"), "the note reports success: REPLY<{reply}>");
 
@@ -2353,7 +2576,7 @@ mod tests {
         let reply = talk(
             control_addr,
             &format!(
-                "GET /ironsurf/serve/apply?root={}&port={restart_port} HTTP/1.1\r\n\r\n",
+                "GET /ironsurf/serve/apply?root={}&port={restart_port}&token={token} HTTP/1.1\r\n\r\n",
                 percent_encode_note(&second.display().to_string())
             ),
         );
@@ -2384,10 +2607,11 @@ mod tests {
         let address = next_address(&server.events).expect("address");
         let port: u16 = address.rsplit(':').next().unwrap().parse().unwrap();
 
+        let token = control_token(server.handle.control_addr);
         let reply = talk(
             server.handle.control_addr,
             &format!(
-                "GET {CONTROL_PATH}/apply?root={} HTTP/1.1\r\n\r\n",
+                "GET {CONTROL_PATH}/apply?root={}&token={token} HTTP/1.1\r\n\r\n",
                 percent_encode_note(&to.display().to_string())
             ),
         );
@@ -2418,13 +2642,26 @@ mod tests {
         // A fresh port: a retired listener can still hold the old one for a
         // moment, and the form's port field is free to say so.
         let new_port = port + 3;
+        let token = control_token(control);
         let body = format!(
-            "root={}&port={new_port}",
+            "root={}&port={new_port}&token={token}",
             percent_encode_note(&post_folder.display().to_string())
         );
         let request = format!(
             "POST {CONTROL_PATH}/apply HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
+        );
+        // AUDIT: a POST is only a form, not an identity. Without the session
+        // token the control socket must refuse, or any page could arrange one.
+        let hostile_body = format!("root={}", percent_encode_note(&post_folder.display().to_string()));
+        let hostile = format!(
+            "POST {CONTROL_PATH}/apply HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: {}\r\n\r\n{hostile_body}",
+            hostile_body.len()
+        );
+        let hostile_reply = talk(control, &hostile);
+        assert!(
+            hostile_reply.starts_with("HTTP/1.1 403"),
+            "an untokened POST must not move the server: {hostile_reply}"
         );
         let reply = talk(control, &request);
         assert!(reply.starts_with("HTTP/1.1 302"), "REPLY<{reply}>");
@@ -2480,10 +2717,11 @@ mod tests {
         let squatter = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = squatter.local_addr().unwrap().port();
 
+        let token = control_token(server.handle.control_addr);
         let reply = talk(
             server.handle.control_addr,
             &format!(
-                "GET /ironsurf/serve/apply?root={}&port={taken} HTTP/1.1\r\n\r\n",
+                "GET /ironsurf/serve/apply?root={}&port={taken}&token={token} HTTP/1.1\r\n\r\n",
                 percent_encode_note(&root.display().to_string())
             ),
         );
@@ -2531,5 +2769,96 @@ mod tests {
         };
         assert!(closed, "the control thread reports Closed");
         wait_until_unreachable(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+
+    // ---------------------------------------------------------------------
+    // AUDIT proofs — each asserts the CURRENT (insecure) behaviour, so a
+    // passing test is the finding. See docs/SECURITY_AUDIT.md.
+    // ---------------------------------------------------------------------
+
+    /// AUDIT F4: the served folder's own origin can *start* the server change.
+    /// `/ironsurf/serve/apply` on the serve socket is answered with a 302 to
+    /// the control socket that keeps the whole query, so a document loaded
+    /// from the served folder needs no token and never has to know the
+    /// control port: a top-level navigation follows the redirect for it.
+    #[test]
+    fn an_archive_page_can_start_the_server_change_without_a_token() {
+        let state = PageState {
+            spec: Spec::default(),
+            serving: Some("http://127.0.0.1:8123".into()),
+            control: Some("http://127.0.0.1:9001".into()),
+            token: String::new(),
+        };
+        let resp = route_request(
+            "GET",
+            "/ironsurf/serve/apply",
+            "root=%2F&host=0.0.0.0&port=4321",
+            &state,
+        );
+        // The serve socket must refuse the mutation outright, not hand it on.
+        assert_ne!(
+            resp.status, 302,
+            "the served origin forwarded a server change to the control socket \
+             at {:?} — a page on the archive origin needs no token",
+            resp.location
+        );
+    }
+
+    /// AUDIT F5: the control page served *on the serve socket* prints the
+    /// control socket's address, and the listing's own footer links to it
+    /// (`<a href="/ironsurf/serve">`). A document already on the served
+    /// origin therefore reads the "random" control port with one same-origin
+    /// fetch, and can then re-point the server at any folder.
+    #[test]
+    fn the_served_origin_discloses_the_control_address() {
+        let root = sandbox("disclose");
+        let state = PageState {
+            spec: Spec { root: root.clone(), host: "127.0.0.1".into(), port: 8123 },
+            serving: Some("http://127.0.0.1:8123".into()),
+            control: Some("http://127.0.0.1:9001".into()),
+            token: "test-token".into(),
+        };
+        let control_page = route_request("GET", "/ironsurf/serve", "", &state);
+        assert_eq!(control_page.status, 200);
+        let body = String::from_utf8_lossy(&control_page.body).into_owned();
+        assert!(
+            !body.contains("http://127.0.0.1:9001"),
+            "the control socket's address was disclosed to the served origin \
+             (one same-origin fetch reveals the port)"
+        );
+        // …and the listing points the browser at that page.
+        let listing = render_listing(&root, "/").expect("listing");
+        assert!(listing.contains("Control page"), "the listing links to it");
+    }
+
+    /// AUDIT F6: the request path is percent-decoded twice (once in
+    /// `parse_request_head`, once per segment in `resolve_inside`). A name the
+    /// listing links to verbatim (`%aé`) therefore reaches
+    /// `percent_decode("%a\u{e9}")`, which slices a `String` off a char
+    /// boundary and panics — killing the serve thread, so the archive stops
+    /// serving for the rest of the session.
+    #[test]
+    fn a_twice_decoded_name_kills_the_path_resolver() {
+        let root = sandbox("twice");
+        std::fs::write(root.join("%a\u{e9}"), b"planted").expect("plant");
+        let listing = render_listing(&root, "/").expect("listing");
+        // The href the listing emits is exactly what a browser puts on the
+        // wire, and it survives url-crate normalisation unchanged.
+        let href = listing
+            .find("href=\"")
+            .map(|at| &listing[at + 6..])
+            .and_then(|rest| rest.split('"').next())
+            .expect("a link in the listing")
+            .to_string();
+        assert_eq!(href, "%25a%C3%A9");
+        // First decode (`parse_request_head`), then per segment below.
+        let once = percent_decode(&href);
+        assert_eq!(once, "%a\u{e9}");
+        let r = std::panic::catch_unwind(|| resolve_inside(&root, &format!("/{once}")));
+        assert!(
+            r.is_ok(),
+            "the percent-decode inside resolve_inside panicked on a name the \
+             listing itself links to"
+        );
     }
 }

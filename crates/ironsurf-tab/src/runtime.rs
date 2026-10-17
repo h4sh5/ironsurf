@@ -807,6 +807,11 @@ pub struct Tab {
     /// page emits [`FromTab::ArchiveServerStart`] and the shell's
     /// [`ToTab::ArchiveServerInfo`] is what the page shows.
     archive_page: Option<String>,
+    /// `true` while the live navigation is one the **user** asked for (typed in
+    /// the shell's address bar, Reload). Page script clears it: only a
+    /// user-chosen address may ask the shell to re-point the archive server or
+    /// open a local file (see [`Tab::ask_archive_server`] and the audit).
+    nav_from_shell: bool,
     /// stdout side of the IPC, shared with [`Tab::dialog`] (a modal pumps
     /// stdin while the loop is inside a JS turn, and must still be able to
     /// emit). All writes go through the `RefCell` — never borrowed across a
@@ -1124,6 +1129,7 @@ impl Tab {
             media_enabled: args.media_enabled,
             media_next_pump: None,
             archive_page: None,
+            nav_from_shell: false,
             net_events,
             console_events,
             css_scan: CssScanState::new(),
@@ -1225,6 +1231,10 @@ impl Tab {
     /// Navigate to `raw` (shell text). `history` says what to do with the
     /// URL-only session history (fresh loads truncate forward entries).
     pub fn navigate(&mut self, raw: &str, history: NavHistory) -> bool {
+        // Shell text: the address bar (or the shell standing in for the user).
+        // This is the one navigation allowed to open a local file or to carry
+        // the archive server's `?root=`/`?host=`/`?port=` overrides.
+        self.nav_from_shell = true;
         self.navigate_post(raw, history, None)
     }
 
@@ -1259,10 +1269,23 @@ impl Tab {
             .filter(|p| *p != 0);
         let open = field("open").is_some();
         self.archive_page = Some(url.as_str().to_string());
+        // AUDIT F2: the query is *page-controlled text*. A remote page that
+        // navigates itself to `ironsurf://archive?root=%2Fetc&host=0.0.0.0`
+        // used to have the shell export any folder on any interface with no
+        // confirmation. Overrides are honoured for the address bar alone — the
+        // documented way a user aims the server — and silently dropped for
+        // anything a page arranged.
+        let from_shell = self.nav_from_shell;
+        if !from_shell {
+            let asked = field("root").is_some() || field("host").is_some() || port.is_some();
+            if asked {
+                warn!("archive server: ignoring root/host/port carried by a page URL");
+            }
+        }
         self.emit(FromTab::ArchiveServerStart {
-            root: field("root"),
-            host: field("host"),
-            port,
+            root: from_shell.then(|| field("root")).flatten(),
+            host: from_shell.then(|| field("host")).flatten(),
+            port: from_shell.then_some(port).flatten(),
             open_in_new_tab: open,
         });
     }
@@ -2358,6 +2381,27 @@ impl Tab {
     /// Called from [`Tab::drain_nav_hook`], i.e. from the poll loop, never
     /// from inside the stack that queued it (a self-redirecting page spins
     /// the loop like any browser's redirect loop; it cannot grow the stack).
+    /// The schemes a document may navigate *itself* into (task: the audit's
+    /// `file:` gap). The web is `http`/`https`, plus `about`, `data` and `blob`
+    /// which pages generate themselves. Local schemes are not reachable from
+    /// the web: `file:` only from a document that is itself a local file, and
+    /// the shell's internal `ironsurf:` never by following a link — those are
+    /// addresses the user types, and [`Tab::nav_from_shell`] is how the tab
+    /// knows the difference. An unknown scheme is the address bar's to try.
+    fn document_may_reach(&self, from: Option<&Url>, to: &Url) -> bool {
+        let to_scheme = to.scheme();
+        if matches!(
+            to_scheme,
+            "http" | "https" | "about" | "data" | "blob" | "ws" | "wss"
+        ) {
+            return true;
+        }
+        if to_scheme == "ironsurf" {
+            return false;
+        }
+        from.is_some_and(|base| base.scheme() == to_scheme)
+    }
+
     fn follow_pending_js_nav(&mut self) -> bool {
         let Some(nav) = self
             .js
@@ -2386,6 +2430,26 @@ impl Tab {
                 return true;
             }
         };
+        // AUDIT F1: a page may only go where a redirect from it may go. A
+        // document on `http(s)` reaching `file:` turned any page visit into
+        // arbitrary local file disclosure (the fetch is answered locally and the
+        // file renders), and `ironsurf:` let the page talk to the shell. Local
+        // schemes stay reachable from a local document and from the user's own
+        // address bar, which is what `nav_from_shell` records.
+        if !self.document_may_reach(base.as_ref(), &resolved) {
+            warn!("refusing page-initiated navigation to {resolved}");
+            self.emit(FromTab::StatusText {
+                text: Some(format!(
+                    "a page may not navigate to {} — open it from the address bar",
+                    resolved
+                )),
+            });
+            // The pending navigation is consumed: the hostile target is dropped,
+            // and the document on screen stays exactly where it was.
+            return true;
+        }
+        // From here the navigation is page-chosen, not user-chosen.
+        self.nav_from_shell = false;
         info!(
             "following js navigation → {resolved} ({})",
             if nav.replace {
@@ -3368,9 +3432,13 @@ impl Tab {
         }
         match msg {
             ToTab::Navigate { url } => {
+                // The address bar is the user: this navigation may carry the
+                // archive overrides and open a local file.
+                self.nav_from_shell = true;
                 self.navigate(&url, NavHistory::Fresh);
             }
             ToTab::Reload => {
+                self.nav_from_shell = true;
                 let Some(url) = self.history.get(self.history_index).cloned() else {
                     return None;
                 };
@@ -4498,6 +4566,9 @@ impl Tab {
                 match form_body_from_nav(&options) {
                     Some(post) => {
                         info!("form POST (blitz hook) → {url} ({} B)", post.body.len());
+                        // The page wrote the action URL, so it is not the
+                        // address bar's navigation.
+                        self.nav_from_shell = false;
                         self.navigate_post(&url, NavHistory::Fresh, Some(&post));
                     }
                     None => {
@@ -4624,6 +4695,9 @@ impl Tab {
             content_type: sub.content_type.clone(),
             body: sub.body.clone(),
         });
+        // As above: a `<form method=get action="ironsurf://archive?root=…">` is
+        // page-authored, however it was submitted.
+        self.nav_from_shell = false;
         self.navigate_post(sub.url.as_str(), NavHistory::Fresh, post.as_ref());
     }
 

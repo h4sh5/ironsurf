@@ -12,6 +12,9 @@ fn main() {
         },
         serving: Some("http://127.0.0.1:8123".into()),
         control: Some("http://127.0.0.1:9001".into()),
+        // The preview stands in for the control page, which is the only render
+        // that carries a session token.
+        token: "preview-token".into(),
     };
     let resp = ironsurf_shell::archive_server::route_request("GET", "/", "", &state);
     print!("{}", String::from_utf8_lossy(&resp.body));
