@@ -117,6 +117,11 @@ pub struct Container {
     #[serde(default)]
     pub proxy: Option<String>,  // per-container proxy: the **name** of a global ProxyDef
                                 // (shell ui.json → proxies); None or a dangling name = direct
+    #[serde(default)]
+    pub private: bool,  // per-container **private browsing** (task: private browsing):
+                        // true = the container's requests carry `DNT: 1` and NONE of its
+                        // visits are written to the shared history.jsonl (shell-side gate);
+                        // cookies/cache/local storage are untouched
 }
 
 /// A user-defined, named proxy in the shell's global pool (`ui.json` → `proxies`);
@@ -283,6 +288,14 @@ pub enum ToTab {
     // or deleted (a deleted definition re-resolves its containers to direct; the
     // stored name survives). Applies from the next request; no reload.
     SetProxy { proxy: Option<String> },
+    // per-container **private browsing** (task: private browsing): the shell sends this
+    // whenever the container's `private` flag flips, and new tabs of a private container
+    // are spawned with `--private` so DNT rides from the very first request. `enabled`
+    // = every subsequent request this tab builds (documents, subresources, form POSTs,
+    // redirect hops, XHR/fetch) carries a `DNT: 1` header; false = no DNT header at all.
+    // History recording is shell-side and not this tab's concern. Applies from the next
+    // request; no reload.
+    SetDoNotTrack { enabled: bool },
     // popup blocking (task: block popups): `block` = refuse every window a user
     // gesture did not authorize (the tab's own default when nobody ever sends
     // this); `allowed` = **document origins** whose popups are never blocked,
@@ -559,6 +572,10 @@ impl ContainerStore {
 // Task: browsing history. History is SHARED across every container — one
 // append-only JSONL log at the data root, opened by path, deliberately NOT
 // through ContainerStore (this browser does not claim per-container history).
+// Task: private browsing — the only per-container rule is at the WRITE side and it
+// lives in the shell: navigations from a container with `private` set are not recorded
+// at all (UrlChanged dropped, TitleChanged has nothing to stamp); the storage layer
+// itself stays flag-free.
 pub struct HistoryEntry { pub url: String, pub title: Option<String>, pub at_unix: i64 } // line-per-entry Serialize
 pub struct History { path: PathBuf }                   // <root>/history.jsonl
 impl History {
@@ -670,7 +687,7 @@ binary or a test-only bin here) that applies the sandbox and exits 42 iff openin
 
 ## ironsurf-tab (library + the `ironsurf` binary) — the Blitz + Boa host
 
-CLI (tab host): `ironsurf tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]` — the shell itself
+CLI (tab host): `ironsurf tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox] [--private]` — the shell itself
 skips the `tab` word and passes straight `--tab-id …` (§One binary, two modes). The
 library entry point is `ironsurf_tab::run(argv) -> i32`, `argv[0]` = program name.
 
@@ -792,6 +809,13 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   straight from the cache without touching the network — and without re-capturing the
   stored `Set-Cookie`s, which were already applied when the response first arrived;
   everything else keeps the revalidation path.
+- **Do Not Track** (task: private browsing): one process-wide switch per tab process
+  (the process IS the container — same placement rule as the proxy cell): `--private`
+  seeds it at spawn, `ToTab::SetDoNotTrack` flips it, and every request builder reads it
+  at build time (`netmod::set_do_not_track`/`do_not_track`/`with_dnt`): while set, a
+  `DNT: 1` header rides documents, subresources, form POSTs, redirect hops and the
+  XHR/`fetch()` path; while clear, no DNT header is sent at all. No reload — the live
+  document stands until its next request.
 - Main-document navigations always go through our own reqwest fetcher in the tab process
   (not via NetProvider), so the managed policy always applies to top-level requests
   regardless of provider mode. Concretely: **the container cookie jar is always
@@ -1433,7 +1457,27 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   forwarding pointer+wheel events; keyboard `key-pressed`/`key-released` → `KeyEvent`).
 - Container manager popup: list containers (color swatch), add/rename/choose color (fixed
   palette), "delete container (+ data)", per-tab "Move tab to container ▸" submenu (move =
-  respawn tab process keeping URL), "New tab in container".
+  respawn tab process keeping URL), "New tab in container". Each row also carries a
+  **Private** checkbox (task: private browsing, see below).
+- **Private browsing** (task: private browsing) — a per-container mode, toggled by the
+  **Private** checkbox on each container-manager row (no toolbar button of its own).
+  Checking it persists the flag (`Store::set_container_private`, in `containers.json`
+  like `user_agent`/`proxy`, `serde(default)` ⇒ legacy files load as off), broadcasts
+  `ToTab::SetDoNotTrack { enabled }` to that container's **live tabs only** (the exact
+  `ua_broadcast` rules), and re-pushes the manager rows + top-bar badge through
+  `sync_ui`. A tab spawned into a private container gets the `--private` spawn flag, so
+  its very first page load already sends `DNT: 1`. The history half needs no wire: the
+  shell's `UrlChanged` recording consults the flag per navigation (`tab_is_private`) and
+  writes nothing — and `TitleChanged` correspondingly finds nothing to stamp; clearing
+  the flag resumes recording at once. Inside the tab the mode is one process-wide switch
+  (`netmod::set_do_not_track`) that every request builder reads at build time.
+  **Visible state**: while the container of the tab on screen is private, the top bar
+  shows a purple `◉ private` badge beside the container dropdown (window property
+  `container-private`, pushed with the container label on every tab switch, every
+  toggle, and dark when no tab is on screen); private rows also read
+  `name · private` in the manager. Cookies, cache and local storage are untouched —
+  the mode is "ask not to be tracked, leave no history". `fake_tab --private /
+  --expect-dnt` echoes `dnt:on|off` at launch and on every wire change.
 - Status bar: **loading progress bar** at the left-hand end (visible only while the active
   tab loads): a 96 px recessed track with a 24 px lit segment sweeping along it
   (`load-progress` 0…11, 4 px a step, ping-ponging; the spinner timer's 120 ms tick

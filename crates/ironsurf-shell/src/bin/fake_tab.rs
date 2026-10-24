@@ -74,6 +74,12 @@ fn main() {
     // and with `--expect-archive-mode` every current value — the launch one
     // and each inbound ToTab::SetArchiveMode — echoes as `archive:on|off`.
     let mut expect_archive_mode = false;
+    // Private-browsing harness (task: private browsing): `--private` is the
+    // spawn-time switch (exactly how the real tab seeds its DNT cell), and
+    // with `--expect-dnt` every current value — the launch one and each
+    // inbound ToTab::SetDoNotTrack — echoes as `dnt:on|off`.
+    let mut expect_dnt = false;
+    let mut current_dnt = false;
     let mut expect_copy = false;
     // Selection-copy harness (task: text-selection copy & paste): Ctrl+C
     // answers with `FromTab::ClipboardText` (what the real tab's engine
@@ -135,6 +141,8 @@ fn main() {
             "--expect-user-agent" => expect_user_agent = true,
             "--expect-proxy" => expect_proxy = true,
             "--archive-mode" => current_archive = true,
+            "--private" => current_dnt = true,
+            "--expect-dnt" => expect_dnt = true,
             "--expect-popup-policy" => expect_popup_policy = true,
             "--popup-blocked" => popup_blocked = true,
             "--expect-archive-mode" => expect_archive_mode = true,
@@ -197,6 +205,14 @@ fn main() {
                 "proxy:{}",
                 current_proxy.clone().unwrap_or_else(|| "direct".into())
             )),
+        });
+    }
+
+    // The spawn-time private switch echoes too, so a test can see the
+    // shell passed `--private` to a tab born in a private container.
+    if expect_dnt {
+        emit(FromTab::StatusText {
+            text: Some(format!("dnt:{}", if current_dnt { "on" } else { "off" })),
         });
     }
 
@@ -481,6 +497,18 @@ fn main() {
                             "ua:{}",
                             current_ua.clone().unwrap_or_else(|| "default".into())
                         )),
+                    });
+                }
+            }
+            // The private-browsing wire (task: private browsing): replace the
+            // current DNT value and — with `--expect-dnt` — echo it on the
+            // status line. The real tab applies it to the next request built;
+            // nothing reloads for this; neither does the fake.
+            ToTab::SetDoNotTrack { enabled } => {
+                current_dnt = enabled;
+                if expect_dnt {
+                    emit(FromTab::StatusText {
+                        text: Some(format!("dnt:{}", if current_dnt { "on" } else { "off" })),
                     });
                 }
             }

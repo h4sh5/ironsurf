@@ -51,6 +51,16 @@ pub struct Container {
     /// loading.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Per-container **private browsing** mode (task: private browsing).
+    /// While set, the shell (a) pushes [`ToTab::SetDoNotTrack`] with
+    /// `enabled = true` to every tab of this container, so each outbound
+    /// request carries `DNT: 1`, and (b) records **nothing** into the
+    /// shared browsing history for navigations from this container.
+    /// Cookies, cache and per-container storage are untouched — private
+    /// browsing here means "ask not to be tracked, leave no history".
+    /// `serde(default)` keeps legacy `containers.json` files loading.
+    #[serde(default)]
+    pub private: bool,
 }
 
 /// A user-defined, **named proxy** (the global pool kept in the shell's
@@ -536,6 +546,18 @@ pub enum ToTab {
     /// live document stands until its next request.
     SetProxy {
         proxy: Option<String>,
+    },
+    /// Per-container **private browsing** (task: private browsing): the
+    /// shell sends this whenever the container's [`Container::private`]
+    /// flag flips, alongside the `--private` spawn flag for new tabs.
+    ///
+    /// `enabled` = send a `DNT: 1` header on **every** outbound request
+    /// this tab makes (documents, subresources, XHR/fetch, form POSTs,
+    /// redirect hops) until the next such message; `false` = send no DNT
+    /// header at all. History recording lives shell-side and is not this
+    /// tab's concern. Nothing reloads — the live document stands.
+    SetDoNotTrack {
+        enabled: bool,
     },
     /// **Archive mode** master switch (the 💾 toolbar menu; global, not
     /// per-container). While `enabled`, the tab emits [`FromTab::ArchivedFetch`]
@@ -1739,6 +1761,7 @@ mod tests {
             is_default: true,
             user_agent: None,
             proxy: None,
+            private: false,
         });
         assert_eq!(ContainerId(1), ContainerId(1));
         assert_ne!(ContainerId(1), ContainerId(2));
@@ -1819,6 +1842,7 @@ mod tests {
                 is_default: false,
                 user_agent: ua.clone(),
                 proxy: None,
+                private: false,
             };
             frame_round_trip(container.clone());
             let json = serde_json::to_string(&container).expect("to json");
@@ -1852,6 +1876,7 @@ mod tests {
                 is_default: false,
                 user_agent: None,
                 proxy: proxy.clone(),
+                private: false,
             };
             frame_round_trip(container.clone());
             let json = serde_json::to_string(&container).expect("to json");
@@ -1868,6 +1893,45 @@ mod tests {
             r##"[{"id":1,"name":"p","color":"#f00","is_default":true,"user_agent":"UA/1"}]"##;
         let back: Vec<Container> = serde_json::from_str(ua_only).expect("ua-era json");
         assert_eq!(back[0].proxy, None);
+    }
+
+    /// Private browsing: the flag round-trips through both codecs, and a
+    /// `containers.json` written before it existed loads as `false` — the
+    /// same legacy-file contract as `user_agent` and `proxy`.
+    #[test]
+    fn container_private_field_round_trips_and_defaults() {
+        for private in [false, true] {
+            let container = Container {
+                id: ContainerId(5),
+                name: "incognito".into(),
+                color: "#aa00ff".into(),
+                is_default: false,
+                user_agent: None,
+                proxy: None,
+                private,
+            };
+            frame_round_trip(container.clone());
+            let json = serde_json::to_string(&container).expect("to json");
+            let back: Container = serde_json::from_str(&json).expect("from json");
+            assert_eq!(back, container);
+        }
+
+        // Any file from before the field — pre-UA, UA-only, proxy-era —
+        // loads with private browsing off.
+        let legacy = r##"[{"id":1,"name":"personal","color":"#ff5500","is_default":true}]"##;
+        let back: Vec<Container> = serde_json::from_str(legacy).expect("legacy json");
+        assert!(!back[0].private);
+    }
+
+    /// `ToTab::SetDoNotTrack` survives the frame codec, both ways.
+    #[test]
+    fn set_do_not_track_round_trips() {
+        frame_round_trip(ToTab::SetDoNotTrack { enabled: true });
+        let msg = frame_round_trip(ToTab::SetDoNotTrack { enabled: false });
+        match msg {
+            ToTab::SetDoNotTrack { enabled } => assert!(!enabled),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

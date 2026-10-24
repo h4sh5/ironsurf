@@ -224,6 +224,12 @@ pub struct TabArgs {
     /// fatal startup error — the flag came from settings the shell already
     /// validated, so a bad one means the invocation itself is broken.
     pub proxy: Option<String>,
+    /// Private browsing at spawn (`--private`, present = on): the tab sends
+    /// `DNT: 1` on every request from its very first fetch until a
+    /// `ToTab::SetDoNotTrack` clears it (task: private browsing). The
+    /// shell appends the flag to spawns in private containers only; the
+    /// history half of the mode is shell-side, never the tab's concern.
+    pub private: bool,
     /// Archive mode master switch at spawn (`--archive-mode`, present = on):
     /// the shell passes it when its 💾 toggle is on, so a fresh tab archives
     /// from its first fetch; `ToTab::SetArchiveMode` moves it afterwards.
@@ -242,6 +248,7 @@ impl TabArgs {
         let mut no_media = false;
         let mut user_agent = None;
         let mut proxy = None;
+        let mut private = false;
         let mut archive_mode = false;
 
         let mut it = args.iter().skip(1);
@@ -264,6 +271,7 @@ impl TabArgs {
                 "--no-media" => no_media = true,
                 "--user-agent" => user_agent = Some(value("user-agent")?),
                 "--proxy" => proxy = Some(value("proxy")?),
+                "--private" => private = true,
                 "--archive-mode" => archive_mode = true,
                 // Verbosity flags: the level itself is read from argv by
                 // `logging::level_from_args` in `run`; they are accepted here so
@@ -305,6 +313,7 @@ impl TabArgs {
                 Ok(_) => proxy,
                 Err(err) => return Err(err.into()),
             },
+            private,
             archive_mode,
         })
     }
@@ -1175,6 +1184,13 @@ impl Tab {
             } else {
                 info!("proxy → {url}");
             }
+        }
+        // …and the container's private-browsing switch (task: private
+        // browsing), before any request can leave: every fetch builder in
+        // netmod reads this one process switch at build time.
+        if args.private {
+            netmod::set_do_not_track(true);
+            info!("private browsing: sending DNT: 1");
         }
         let archive = crate::archive::ArchiveState::shared(args.archive_mode);
         let provider = Arc::new(
@@ -4103,6 +4119,17 @@ impl Tab {
                     .user_agent
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = effective;
+            }
+            ToTab::SetDoNotTrack { enabled } => {
+                // The container's private-browsing flag flipped (task:
+                // private browsing). From this point every request —
+                // documents, subresources, form POSTs, redirect hops,
+                // XHR/fetch — carries `DNT: 1` while `enabled`, and none
+                // carries it once cleared. Nothing reloads — the live
+                // document stands until its next request; history
+                // recording is shell-side and not this tab's concern.
+                netmod::set_do_not_track(enabled);
+                info!("do-not-track \u{2192} {enabled}");
             }
             ToTab::SetProxy { proxy } => {
                 // The container's proxy moved (re-selected, cleared, or one
@@ -7368,6 +7395,7 @@ mod tests {
             user_agent: None,
             proxy: None,
             archive_mode: false,
+            private: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let tab = Tab::new_headless(&args, pipe);
@@ -7444,6 +7472,7 @@ mod tests {
             user_agent: None,
             proxy: None,
             archive_mode: false,
+            private: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
@@ -8980,6 +9009,7 @@ mod tests {
             user_agent: None,
             proxy: None,
             archive_mode: false,
+            private: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);
@@ -9381,6 +9411,7 @@ mod tests {
             user_agent: None,
             proxy: None,
             archive_mode: false,
+            private: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);

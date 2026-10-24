@@ -31,6 +31,10 @@ export struct ContainerInfo {
     /// Rust from the registry so the manager rows say which container rides
     /// which proxy (task: proxies).
     proxy: string,
+    /// The container's **private browsing** flag (task: private browsing);
+    /// Rust reads it from the registry, so the manager's Private checkbox
+    /// mirrors the stored state.
+    private: bool,
 }
 
 /// One URL-bar autocomplete candidate (task: URL bar autocomplete): a
@@ -695,6 +699,12 @@ export component AppWindow inherits Window {
     /// instant a load starts, so every navigation begins the sweep afresh.
     in property <int> load-progress: 0;
     in property <string> container-label: "";
+    /// Private browsing (task): true while the container of the tab **on
+    /// screen** browses privately — the top bar's ◒ badge lights up, so the
+    /// user always sees which mode the visible tab is in. Per container,
+    /// not a global switch; Rust pushes it with the label on every tab
+    /// switch and every toggle.
+    in property <bool> container-private: false;
     in property <bool> can-back: false;
     in property <bool> can-fwd: false;
     in property <bool> manager-open: false;
@@ -956,6 +966,10 @@ export component AppWindow inherits Window {
     callback mgr-add();
     callback mgr-recolor(idx: int, palette: int);
     callback mgr-select(idx: int);
+    /// The container manager's Private checkbox (task: private browsing):
+    /// flip the flag for row `idx`, push DNT to that container's live tabs,
+    /// restamp the top-bar badge when the container is the active one.
+    callback mgr-toggle-private(idx: int);
     // raw keyboard/pointer events from the page; Rust decides chords
     callback page-key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
     // kind: 0 move, 1 down, 2 up, 4 out — button: 0 left, 1 right, 2 middle
@@ -1203,6 +1217,25 @@ export component AppWindow inherits Window {
                 // button it shares a folder-with-draft pattern with: the same
                 // house rule for the button (it only ever toggles the overlay).
                 MiniButton { label: "\u{2B07}"; clicked => { root.toggle-download-menu(); } }
+
+                // private browsing (task: private browsing) — a badge that
+                // sits beside the container dropdown and only exists while
+                // the visible tab's container browses privately: DNT on,
+                // nothing written to the shared history. Per container —
+                // Rust pushes `container-private` with the label, so the
+                // badge always speaks about the tab on screen.
+                Rectangle {
+                    visible: root.container-private;
+                    height: 24px;
+                    width: priv-lbl.preferred-width + 16px;
+                    bgrp := Rectangle { background: #6b2fbf; border-radius: 4px; }
+                    priv-lbl := Text {
+                        text: "\u{25C9} private";
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
 
                 // container dropdown: shows the active tab's container,
                 // opens the manager on click
@@ -2049,7 +2082,8 @@ export component AppWindow inherits Window {
                             Text {
                                 visible: i != root.editing-index;
                                 text: c.name + (c.isDefault ? " ★" : "")
-                                    + (c.proxy != "" ? " · " + c.proxy : "");
+                                    + (c.proxy != "" ? " · " + c.proxy : "")
+                                    + (c.private ? " · private" : "");
                                 color: #e8e8e8;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -2060,6 +2094,19 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 22px;
                             spacing: 6px;
+                            // Private browsing (task): one checkbox per
+                            // container row — DNT on for its tabs, no visits
+                            // in the shared history, and the top-bar badge
+                            // lights when such a tab is on screen. First in
+                            // the row, deliberately: the buttons behind it
+                            // are what overflow a narrow panel, never the
+                            // toggle (a trailing checkbox ran off the
+                            // window's edge).
+                            CheckBox {
+                                text: "Private";
+                                checked: c.private;
+                                toggled => { root.mgr-toggle-private(i); }
+                            }
                             MiniButton { label: "New"; clicked => { root.mgr-new-tab-in(i); } }
                             MiniButton { label: "Move tab"; clicked => { root.mgr-move-tab-to(i); } }
                             MiniButton {

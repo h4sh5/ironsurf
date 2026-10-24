@@ -41,7 +41,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use blitz_traits::net::{Bytes, HeaderMap, NetHandler, NetProvider, NetWaker, Request};
@@ -345,6 +345,40 @@ pub fn read_user_agent(user_agent: &SharedUserAgent) -> String {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+// ---------------------------------------------------------------------------
+// Do Not Track (task: private browsing)
+
+/// This tab process's **Do Not Track** switch (born off). The tab process
+/// IS the container (ARCHITECTURE §Design overview), so — exactly like the
+/// process proxy cell — there is one per process and no ambiguity: the
+/// `--private` spawn flag seeds it, `ToTab::SetDoNotTrack` replaces it, and
+/// every request started after the change (documents, subresources, form
+/// POSTs, redirect hops, XHR/`fetch`) carries the answer: while set, a
+/// `DNT: 1` header rides along; while clear, no DNT header is sent at all.
+static DO_NOT_TRACK: AtomicBool = AtomicBool::new(false);
+
+/// Flip the process-wide DNT switch (the header itself is applied per
+/// request at build time, so the next request is already affected).
+pub fn set_do_not_track(enabled: bool) {
+    DO_NOT_TRACK.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether outbound requests must carry `DNT: 1` right now.
+#[must_use]
+pub fn do_not_track() -> bool {
+    DO_NOT_TRACK.load(Ordering::Relaxed)
+}
+
+/// Add the `DNT: 1` header to a request being built, when the switch is on
+/// (a no-op otherwise — a clear switch sends no DNT header at all).
+fn with_dnt(req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    if do_not_track() {
+        req.header("DNT", "1")
+    } else {
+        req
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,7 +1705,9 @@ fn build_request(
         }
         None => client.get(url.as_str()),
     };
-    req
+    // Private browsing (task): every request this process builds carries
+    // DNT: 1 while the switch is on (XHR builds its own, handled beside).
+    with_dnt(req)
 }
 
 /// Plain (`Passthrough`) HTTP fetch (GET, or a form `POST` with `post`):
@@ -1786,10 +1822,12 @@ where
     let started = std::time::Instant::now();
     let parsed_method = reqwest::Method::from_bytes(verb.as_bytes())
         .map_err(|_| format!("xhr: bad method {method:?}"))?;
-    let mut req = shared_worker()
-        .client()
-        .request(parsed_method, url.as_str())
-        .header("User-Agent", user_agent);
+    let mut req = with_dnt(
+        shared_worker()
+            .client()
+            .request(parsed_method, url.as_str())
+            .header("User-Agent", user_agent),
+    );
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("cookie") || name.eq_ignore_ascii_case("user-agent") {
             continue; // the jar owns Cookie, the UA cell owns User-Agent
@@ -5097,6 +5135,123 @@ mod user_agent_tests {
 }
 
 #[cfg(test)]
+mod dnt_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).expect("test url")
+    }
+
+// -- Do Not Track (task: private browsing) --------------------------------
+
+/// The DNT switch is process-wide (like the proxy cell); its fetch
+/// tests serialize on this, exactly like the proxy tests do.
+static DNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Loopback server answering with the `DNT` header of the request it
+/// received (empty body when the request carried none) — the honest
+/// witness that the header rides the wire only while the switch is on.
+fn spawn_dnt_echo() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut head: Vec<u8> = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+                if head.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            // Case-insensitive scan of the request lines for `DNT:`.
+            let mut value = String::new();
+            for line in String::from_utf8_lossy(&head).lines() {
+                if let Some(rest) = line.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("dnt")).map(|(_, v)| v.trim()) {
+                    value = rest.to_string();
+                }
+            }
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                value.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(value.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+#[test]
+fn dnt_switch_defaults_off_and_follows_every_write() {
+    // (Fresh process: the static is born off.)
+    let _serial = DNT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(!do_not_track(), "born off: no DNT unless a container is private");
+    set_do_not_track(true);
+    assert!(do_not_track());
+    set_do_not_track(false);
+    assert!(!do_not_track());
+}
+
+/// The header rides the wire exactly when the switch says so — on the
+/// plain fetch path (which builds through [`build_request`], the same
+/// builder the document/subresource loop uses).
+#[test]
+fn dnt_header_follows_the_switch() {
+    let _serial = DNT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let port = spawn_dnt_echo();
+    let u = url(&format!("http://127.0.0.1:{port}/"));
+    let client = reqwest::blocking::Client::new();
+    set_do_not_track(false);
+    assert_eq!(
+        plain_http_fetch(&client, &u, None, None).expect("off fetch").body,
+        b"",
+        "a clear switch sends no DNT header at all"
+    );
+    set_do_not_track(true);
+    assert_eq!(
+        plain_http_fetch(&client, &u, None, None).expect("on fetch").body,
+        b"1",
+        "the next request after the flip carries DNT: 1"
+    );
+    set_do_not_track(false);
+    assert_eq!(
+        plain_http_fetch(&client, &u, None, None).expect("off again").body,
+        b"",
+        "clearing it stops the header again"
+    );
+}
+
+/// …and on the XHR/`fetch()` path, which builds its own request beside
+/// [`build_request`].
+#[test]
+fn dnt_header_follows_the_switch_on_the_xhr_path() {
+    let _serial = DNT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let port = spawn_dnt_echo();
+    let u = url(&format!("http://127.0.0.1:{port}/"));
+    let ua = new_user_agent(None);
+    let mut jar = CookieJar::new();
+    set_do_not_track(false);
+    let off = xhr_fetch_report("GET", &u, &[], None, &mut jar, 0, &ua, None)
+        .expect("xhr off fetch");
+    assert_eq!(off.body, b"", "no DNT while the switch is clear");
+    set_do_not_track(true);
+    let on = xhr_fetch_report("GET", &u, &[], None, &mut jar, 0, &ua, None)
+        .expect("xhr on fetch");
+    assert_eq!(on.body, b"1", "XHR carries DNT: 1 while private");
+    set_do_not_track(false);
+}
+
+}
+
+
 mod proxy_tests {
     use super::*;
 

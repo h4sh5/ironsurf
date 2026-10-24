@@ -136,6 +136,7 @@ impl Store {
                 is_default: true,
                 user_agent: None,
                 proxy: None,
+                private: false,
             });
             store.default_id = id;
             store.save()?;
@@ -185,6 +186,7 @@ impl Store {
             is_default: false,
             user_agent: None,
             proxy: None,
+            private: false,
         });
         self.save()?;
         Ok(id)
@@ -316,6 +318,24 @@ impl Store {
             .find(|c| c.id == id)
             .ok_or(StoreError::NoSuchContainer(id))?;
         container.proxy = proxy;
+        self.save()
+    }
+
+    /// Set the per-container **private browsing** flag for `id` (persisted
+    /// in `containers.json`, like [`Store::set_container_proxy`]).
+    ///
+    /// While set, the shell sends `DNT: 1` on that container's traffic (via
+    /// [`ironsurf_common::ToTab::SetDoNotTrack`] and the `--private` spawn
+    /// flag) and records **no** browsing-history entries for its tabs.
+    /// The flag itself is a plain `bool` — nothing to validate; an unknown
+    /// id is [`StoreError::NoSuchContainer`] and leaves the file untouched.
+    pub fn set_container_private(&mut self, id: ContainerId, private: bool) -> Result<(), StoreError> {
+        let container = self
+            .containers
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        container.private = private;
         self.save()
     }
 

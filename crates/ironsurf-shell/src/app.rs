@@ -79,6 +79,15 @@ fn container_proxy(store: &ironsurf_storage::Store, container: ContainerId) -> O
         .filter(|n| !n.trim().is_empty())
 }
 
+/// Whether `container` browses **privately** (task: private browsing):
+/// its tabs send `DNT: 1` (via the `--private` spawn flag and
+/// [`ironsurf_common::ToTab::SetDoNotTrack`]) and none of its visits is
+/// written to the shared browsing history. An unknown container reads as
+/// not private.
+fn container_private(store: &ironsurf_storage::Store, container: ContainerId) -> bool {
+    store.container(container).is_some_and(|c| c.private)
+}
+
 /// Resolve a container's stored definition *name* into the URL live tabs
 /// ride: the settings' definition with that exact name whose URL still
 /// validates (`validate_proxy_url` guards entry, but `ui.json` may hold
@@ -823,6 +832,12 @@ impl Core {
             ) {
                 extra.push("--proxy".to_string());
                 extra.push(url);
+            }
+            // …and the container's **private browsing** flag (task: private
+            // browsing), so the very first page load of a fresh tab already
+            // sends DNT: 1.
+            if container_private(&store, container) {
+                extra.push("--private".to_string());
             }
             // A fresh tab starts archiving from its very first fetch when
             // the 💾 mode is on (task: archive mode).
@@ -2624,6 +2639,10 @@ impl Core {
                 extra.push("--proxy".to_string());
                 extra.push(url);
             }
+            // …and the destination container's private-browsing flag.
+            if container_private(&self.store.borrow(), cid) {
+                extra.push("--private".to_string());
+            }
             if self.settings.borrow().archive_enabled {
                 extra.push("--archive-mode".to_string());
             }
@@ -2771,6 +2790,53 @@ impl Core {
     fn mgr_select(&self, idx: i32) {
         if let Some(ui) = self.ui() {
             ui.set_selected_container(idx);
+        }
+    }
+
+    /// The container manager's **Private browsing** checkbox (task: private
+    /// browsing): flip the flag on the container, then push the new state to
+    /// every **live** tab of that container only — tabs in other containers
+    /// keep sending what they were sending ([`Core::private_broadcast`]).
+    /// New tabs of the container get the `--private` spawn flag from
+    /// `open_tab`. The history half needs no broadcast: recording consults
+    /// the flag per navigation, so visits simply stop (or resume) at once.
+    fn mgr_toggle_private(&self, idx: usize) {
+        let Some(cid) = self.containers_snapshot().get(idx).copied() else { return };
+        let enabled = !container_private(&self.store.borrow(), cid);
+        match self.store.borrow_mut().set_container_private(cid, enabled) {
+            Ok(()) => info!("container {} private browsing → {enabled}", cid.0),
+            Err(err) => {
+                warn!("private browsing not stored for container {}: {err}", cid.0);
+                return;
+            }
+        }
+        self.private_broadcast(cid, enabled);
+        self.sync_ui();
+    }
+
+    /// Push `ToTab::SetDoNotTrack` to every **live** tab of `container`
+    /// (crashed and closed tabs skipped, send failures only logged — the
+    /// exact [`Core::ua_broadcast`] rules).
+    /// Whether the live tab `tid` belongs to a **private** container (task:
+    /// private browsing) — what the history recording consults per
+    /// navigation. A tid unknown to the process list reads as not private.
+    fn tab_is_private(&self, tid: TabId) -> bool {
+        self.procs
+            .borrow()
+            .iter()
+            .find(|p| p.tab.id == tid)
+            .is_some_and(|p| container_private(&self.store.borrow(), p.tab.container))
+    }
+
+    fn private_broadcast(&self, container: ContainerId, enabled: bool) {
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.tab.container != container || p.crashed || p.state.closed {
+                continue;
+            }
+            if let Err(err) = p.tab.send(ToTab::SetDoNotTrack { enabled }) {
+                debug!("do-not-track not delivered to tab {}: {err}", p.tab.id);
+            }
         }
     }
 
@@ -4741,6 +4807,14 @@ impl Core {
                 if !worth_recording(url) {
                     continue;
                 }
+                // Private browsing (task: private browsing): a tab of a
+                // private container leaves **no** trace in the shared log —
+                // the navigation happens, nothing is written, and no open
+                // history view is refreshed.
+                if self.tab_is_private(tid) {
+                    debug!("history: {url} not recorded (private container)");
+                    continue;
+                }
                 // The title is deliberately **not** read from the tab here: at
                 // the moment the address changes the new document has not been
                 // parsed, so the tab's title is still the *previous* page's —
@@ -4769,11 +4843,15 @@ impl Core {
             if let FromTab::TitleChanged { title } = &msg {
                 let url = {
                     let procs = self.procs.borrow();
-                    procs
-                        .iter()
-                        .find(|p| p.tab.id == tid)
-                        .and_then(|p| p.state.url.clone())
+                    let proc = procs.iter().find(|p| p.tab.id == tid);
+                    // Private browsing (task): the visit was never written
+                    // for a private container, so there is nothing to title
+                    // there either.
+                    let private = proc
+                        .is_some_and(|p| container_private(&self.store.borrow(), p.tab.container));
+                    proc.and_then(|p| p.state.url.clone())
                         .filter(|u| worth_recording(u))
+                        .filter(|_| !private)
                 };
                 let Some(url) = url else { continue };
                 let history = ironsurf_storage::History::open(self.store.borrow().root());
@@ -5067,6 +5145,9 @@ impl Core {
                 // the chosen definition name ("" = direct) — the manager
                 // rows say which container rides which proxy (task: proxies)
                 proxy: c.proxy.clone().filter(|n| !n.trim().is_empty()).unwrap_or_default().into(),
+                // the manager's Private checkbox mirrors the stored flag
+                // (task: private browsing)
+                private: c.private,
             })
             .collect();
         ui.set_containers(ModelRc::from(Rc::new(VecModel::from(conts))));
@@ -5109,10 +5190,17 @@ impl Core {
             ui.set_sec_color(color_hex(color));
             if let Some(c) = store.container(p.tab.container) {
                 ui.set_container_label(c.name.clone().into());
+                // Private browsing (task): the top-bar badge lights up for
+                // the container of the tab **on screen** — per container,
+                // not global.
+                ui.set_container_private(c.private);
             }
         } else {
             let status = self.spawn_error.borrow().clone().unwrap_or_default();
             ui.set_status_text(status.into());
+            // No tab on screen, no private container to claim (task: private
+            // browsing) — the badge falls dark with the label.
+            ui.set_container_private(false);
             // No tab, nothing to claim about its popups: the ⛔ stays on screen
             // but falls silent rather than repeating the last tab's answer
             // (task: popup blocker tooltip).
@@ -5243,6 +5331,14 @@ impl Core {
         {
             let c = self.clone();
             ui.on_mgr_select(move |idx| c.mgr_select(idx));
+        }
+        {
+            let c = self.clone();
+            ui.on_mgr_toggle_private(move |idx| {
+                if idx >= 0 {
+                    c.mgr_toggle_private(idx as usize);
+                }
+            });
         }
         {
             let c = self.clone();
