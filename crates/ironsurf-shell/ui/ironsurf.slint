@@ -2094,6 +2094,19 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 22px;
                             spacing: 6px;
+                            // Private browsing (task): one checkbox per
+                            // container row — DNT on for its tabs, no visits
+                            // in the shared history, and the top-bar badge
+                            // lights when such a tab is on screen. First in
+                            // the row, deliberately: the buttons behind it
+                            // are what overflow a narrow panel, never the
+                            // toggle (a trailing checkbox ran off the
+                            // window's edge).
+                            CheckBox {
+                                text: "Private";
+                                checked: c.private;
+                                toggled => { root.mgr-toggle-private(i); }
+                            }
                             MiniButton { label: "New"; clicked => { root.mgr-new-tab-in(i); } }
                             MiniButton { label: "Move tab"; clicked => { root.mgr-move-tab-to(i); } }
                             MiniButton {
@@ -2102,15 +2115,6 @@ export component AppWindow inherits Window {
                                 clicked => { root.mgr-delete(i); }
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            // Private browsing (task): one checkbox per
-                            // container row — DNT on for its tabs, no visits
-                            // in the shared history, and the top-bar badge
-                            // lights when such a tab is on screen.
-                            CheckBox {
-                                text: "Private";
-                                checked: c.private;
-                                toggled => { root.mgr-toggle-private(i); }
-                            }
                         }
                     }
                 }
